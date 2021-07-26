@@ -1,0 +1,202 @@
+---
+title: "Census_Demographics"
+author: "JesseGordon"
+date: "7/24/2021"
+output: html_document
+---
+
+# Setup functions
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+```
+
+# Census_Demographics Description 
+
+This script identifies the demographics of possible State Rep districts surrounding Randolph Massahsetts. The goal is to identify possible "majority-minority districts" where all of Randolph is included, with several surrounding precincts, in such a way that the result is a majority non-white district. 
+
+The rules are that districts must be "contiguous", with all precincts touching one another. So we start with the "Core" of 12 precincts of Randolph, then loop through all of the immediately "Adjacent" precincts, adding contiguous "Distant" or other "Adjacent" precincts until the target population is reached for the whole district. 
+
+The results will be submitted to the Joint Committee on Redistricting, with political considerations added (for example, the Committee Chair wants to protect Milton precincts 1 and 10 because they are in another majority-minority district -- so that district should show up in our resuts, but should not get submitted as a possible district.) This script could also be used for a State Senate district by adding more surrounding towns and Boston wards. 
+
+The data comes from the 2019 Census estimates, with sources detailed in Census_Demographics.xls. It will need a 2020 update once the Census data is finalized. You can fill in the new figures when available -- the spreadsheet is arranged in the same manner as the online census report, for easy manual transfer (I guess one could write a "scraper" script!). The Committee Chair claimed that the 2020 data is available already (July 2021), but that's not true -- there's no precinct-by-precinct breakdown available yet, except in Pennsylvania. 
+
+# Setup data
+
+```{r initializations}
+
+# How many people must be in a district, minimum? 
+# This is the new 2020 census population of Massachusetts divided by the number of State Rep districts.
+# That's about 6.89 million / 160 = 43,062 (if doing State Senate districts, divide by 40 instead of 160!)  
+# The code stops when that figure is reached, but because every precinct is 3,000 to 4,000 people, the total could go to the minimum plus one precinct. So start a little low!
+target_district_size <- 42000
+
+raw_census_path <- getwd() 
+raw_census_file <- str_c (raw_census_path, '/Census_Demographics.csv')
+raw_census <- read_csv(raw_census_file)   # Very raw! In two sections!
+
+max_census_rows <- nrow(raw_census)
+max_census_cols <- ncol(raw_census)
+
+
+```
+
+# Setup demographic data
+
+First section: demographic info in one column per precinct, pivoted into this format: 
+Precinct_Name/Precinct_Status/Precinct_White/Precinct_Non_White
+
+```{r initialize_demographics}
+
+demographic_colnames <- c("Precinct_Name", "Precinct_Status", "Precinct_White", "Precinct_Non_White")
+
+demographic_info <- as_tibble(data.frame(matrix(nrow=0,ncol=length(demographic_colnames)))) 
+
+# Create empty columns and declare column types
+colnames(demographic_info) <- demographic_colnames
+demographic_info$Precinct_Name   <-as.character(demographic_info$Precinct_Name)
+demographic_info$Precinct_Status <-as.character(demographic_info$Precinct_Status)
+demographic_info$Precinct_White  <-as.integer(demographic_info$Precinct_White)
+demographic_info$Precinct_Non_White  <- as.integer(demographic_info$Precinct_Non_White)
+
+demographic_input <- 1
+while (demographic_input < max_census_cols) {
+  precinct_name <- colnames(raw_census)[demographic_input]
+  white_size <- as.numeric(raw_census[2,demographic_input])
+  # Add up Hispanic, Black, Asian, Native, Pacific census counts 
+  non_white_size <- as.numeric(raw_census[3,demographic_input]) + as.numeric(raw_census[4,demographic_input]) + as.numeric(raw_census[5,demographic_input]) + as.numeric(raw_census[6,demographic_input]) + as.numeric(raw_census[7,demographic_input]) 
+  contiguity_status <- as.character(raw_census[9,demographic_input])
+  if (contiguity_status == 'Core' || contiguity_status == 'Adjacent' || contiguity_status == 'Distant') {
+    # print(paste (non_white_size, precinct_name))
+    demographic_info <- demographic_info %>% add_row("Precinct_Name" = precinct_name, "Precinct_Status" = contiguity_status, "Precinct_White" = white_size, "Precinct_Non_White" = non_white_size)
+  }
+  demographic_input = demographic_input+1
+}
+
+```
+
+# Contiguity tables
+
+Basic method is: for each adjacent precinct, add it and keep adding contiguous precincts until target size is reached. Here we set up what's adjacent, and which ones can be added ("non-core")
+
+```{r initialize_contiguity}
+ 
+contiguity_core <- demographic_info %>% 
+  filter (Precinct_Status == "Core") %>%
+  select (Precinct_Name, Precinct_Status, Precinct_White, Precinct_Non_White)
+
+core_white_size <- sum(contiguity_core$Precinct_White,na.rm=TRUE)
+core_non_white_size <- sum(contiguity_core$Precinct_Non_White)
+
+contiguity_adjacent <- demographic_info %>% 
+  filter (Precinct_Status == "Adjacent") %>%
+  select (Precinct_Name, Precinct_Status, Precinct_White, Precinct_Non_White)
+
+contiguity_non_core <- demographic_info %>% 
+  filter (Precinct_Status != "Core" ) %>%
+  select (Precinct_Name, Precinct_Status, Precinct_White, Precinct_Non_White)
+
+```
+
+# Setup contiguity data
+
+Second section: for all non-core precincts, contiguity info in this format: 
+Main_Precinct_Name/Contiguous_Precinct_Name
+There are numerous "excess" precincts too (like Boston) -- they're in red in the original XLS spreadsheet, and we include them here but ignore them by seeing if their name is valid (if it exists in non-core precincts). To add MORE territory for a wider analysis, just fill those in!
+
+```{r setup_contiguity}
+contiguity_colnames <- c("Main_Precinct_Name", "Contiguous_Name")
+
+contiguity_info <- as_tibble(data.frame(matrix(nrow=0,ncol=length(contiguity_colnames)))) 
+
+# Create empty columns and declare column types
+colnames(contiguity_info) <- contiguity_colnames
+contiguity_info$Main_Precinct_Name   <-as.character(contiguity_info$Main_Precinct_Name)
+contiguity_info$Contiguous_Name <-as.character(contiguity_info$Contiguous_Name)
+
+demographic_input <- 1   # Run thru all precincts to list contiguous precincts
+while (demographic_input < max_census_cols) { 
+  precinct_name <- colnames(raw_census)[demographic_input]
+  contiguity_status <- as.character(raw_census[9,demographic_input])
+  if (contiguity_status == 'Adjacent' || contiguity_status == 'Distant') {
+       contiguity_input <- 10
+       while (contiguity_input < 20) {
+         contiguous_name <- as.character(raw_census[contiguity_input,demographic_input])
+         
+       contiguity_info <- contiguity_info %>% add_row ("Main_Precinct_Name" = precinct_name, "Contiguous_Name" = contiguous_name)
+       
+       contiguity_input = contiguity_input + 1
+       }  # while contiguity_input < 20
+    }  # if Adjacent or Distant
+  demographic_input = demographic_input + 1
+}  # while demographic_input < max_census_cols
+
+# Remove columns that have no names (i.e. max is 10 columns, so some are blank)
+contiguity_info <- contiguity_info %>% drop_na() 
+# Pull in for contiguous_name: Precinct_Status Precinct_White Precinct_Non_White 
+contiguity_info <- dplyr::left_join(contiguity_info, contiguity_non_core, by=c("Contiguous_Name" = "Precinct_Name"))
+# Remove Randolph, Boston, Brockton, etc (those which have no left join) 
+contiguity_info <- contiguity_info %>% drop_na() 
+ 
+```
+
+# Let's make some districts! Our method:
+- Start with the contiguity_core of 12 Randolph precincts. 
+- Add one of the contiguity_adjacent precincts, looping through them. 
+- Add ITS contiguous precincts, looping thru contiguity_non_core...
+- ...until target_district_size reached (& output)
+- Repeat that for every possibility to build complete output list
+- Calculate the white and non-white figures, and rank by percent!
+
+```{r setup_districts}
+
+district_colnames <- c("Pct1_Name", "Pct2_Name", "Pct3_Name","District_White", "District_Non_White", "District_Size", "Pct1_White", "Pct2_White", "Pct3_White", "Pct1_Non_White", "Pct2_Non_White", "Pct3_Non_White" )
+
+district_info <- as_tibble(data.frame(matrix(nrow=0,ncol=length(district_colnames)))) 
+
+colnames(district_info) <- district_colnames
+district_info$Pct1_Name   <-as.character(district_info$Pct1_Name)
+district_info$Pct2_Name   <-as.character(district_info$Pct2_Name)
+district_info$Pct3_Name   <-as.character(district_info$Pct3_Name)
+district_info$District_White  <-as.integer(district_info$District_White)
+district_info$District_Non_White <- as.integer(district_info$District_Non_White)
+district_info$District_Size <- as.integer(district_info$District_Size)
+district_info$Pct1_White  <-as.integer(district_info$Pct1_White)
+district_info$Pct2_White  <-as.integer(district_info$Pct2_White)
+district_info$Pct3_White  <-as.integer(district_info$Pct3_White)
+district_info$Pct1_Non_White <- as.integer(district_info$Pct1_Non_White)
+district_info$Pct2_Non_White <- as.integer(district_info$Pct2_Non_White)
+district_info$Pct3_Non_White <- as.integer(district_info$Pct3_Non_White)
+
+for (Pct1_input in 1:nrow(contiguity_adjacent)) {  
+  pct1_name <- contiguity_adjacent$Precinct_Name[Pct1_input]
+  pct1_contiguity <- contiguity_info %>% filter (Main_Precinct_Name == pct1_name) 
+  pct1_white_size <- contiguity_adjacent$Precinct_White[Pct1_input]
+  pct1_non_white_size <- contiguity_adjacent$Precinct_Non_White[Pct1_input]
+  for (Pct2_input in 1:nrow(pct1_contiguity)) {  
+    pct2_name <- pct1_contiguity$Contiguous_Name[Pct2_input]
+    pct2_white_size <- pct1_contiguity$Precinct_White[Pct2_input]
+    pct2_non_white_size <- pct1_contiguity$Precinct_Non_White[Pct2_input]
+    pct2_contiguity <- contiguity_info %>% filter (Main_Precinct_Name == pct2_name) 
+    for (Pct3_input in 1:nrow(pct2_contiguity)) {  
+      pct3_name <- pct2_contiguity$Contiguous_Name[Pct3_input]
+      pct3_white_size <- pct2_contiguity$Precinct_White[Pct3_input]
+      pct3_non_white_size <- pct2_contiguity$Precinct_Non_White[Pct3_input]
+      pct3_contiguity <- contiguity_info %>% filter (Main_Precinct_Name == pct3_name) 
+      if (pct1_name != pct2_name & pct1_name != pct3_name) {
+        district_white <- core_white_size + pct1_white_size + pct2_white_size + pct3_white_size
+        district_non_white <- core_non_white_size + pct1_non_white_size + pct2_non_white_size + pct3_non_white_size
+        district_size <- district_non_white + district_white
+        district_info <- district_info %>% add_row("Pct1_Name" = pct1_name, "Pct2_Name" = pct2_name, "Pct3_Name" = pct3_name, "District_White" = district_white, "District_Non_White" = district_non_white, "District_Size" = district_size, "Pct1_Non_White" = pct1_non_white_size, "Pct2_Non_White" = pct2_non_white_size, "Pct3_Non_White" = pct3_non_white_size, "Pct1_White" = pct1_white_size, "Pct2_White" = pct2_white_size, "Pct3_White" = pct3_white_size)
+      } # If three different pct's
+    } # for Pct3_input
+  }   # for Pct2_input
+}     # for Pct1_input
+
+write_csv(district_info, "Census_Districts.csv")  
+
+```
+
+To create other majority-minority State Rep districts, get new census figures by precinct and upload a CSV file. That should be done for Randolph 2020 when new figures are available. 
+The core should be one town, and the code is set up to always have three other precincts. You'd have to recode for some number other than three. 
